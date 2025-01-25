@@ -70,7 +70,7 @@ INVALID_LOGPROB = 1.0
 
 class RLOOTrainer(Trainer):
     _tag_names = ["trl", "rloo"]
-
+    
     def __init__(
         self,
         config: RLOOConfig,
@@ -79,7 +79,7 @@ class RLOOTrainer(Trainer):
         ],
         policy: nn.Module,
         ref_policy: nn.Module,
-        reward_model: Union[nn.Module, Callable[[list[str]], list[float]]],
+        reward_models: Union[list[nn.Module], list[Callable[[list[str]], list[float]]]],
         train_dataset: Dataset,
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
@@ -108,7 +108,7 @@ class RLOOTrainer(Trainer):
         self.policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
 
         self.ref_policy = ref_policy
-        self.reward_model = reward_model
+        self.reward_models = reward_models
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.data_collator = data_collator
@@ -151,7 +151,7 @@ class RLOOTrainer(Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [policy, ref_policy, reward_model]:
+        for module in [policy, ref_policy] + [rm for rm in reward_models]:
             if isinstance(module, nn.Module):
                 disable_dropout_in_model(module)
         if args.stop_token and args.stop_token == "eos":
@@ -220,18 +220,23 @@ class RLOOTrainer(Trainer):
         self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
-            if isinstance(self.reward_model, nn.Module):
-                self.reward_model = prepare_deepspeed(
-                    self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
-                )
+            for i in range(len(self.reward_models)):
+                reward_model = self.reward_models[i]
+                if isinstance(reward_model, nn.Module):
+                    self.reward_models[i] = prepare_deepspeed(
+                        reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
+                    )
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
             )
             self.deepspeed = self.model
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
-            if isinstance(self.reward_model, nn.Module):
-                self.reward_model = self.reward_model.to(self.accelerator.device)
+            for i in range(len(self.reward_models)):
+                reward_model = self.reward_models[i]
+                if isinstance(reward_model, nn.Module):
+                    self.reward_models[i] = reward_model.to(self.accelerator.device)
+
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -246,7 +251,7 @@ class RLOOTrainer(Trainer):
         model = self.model
         self.model_wrapped = self.model
         ref_policy = self.ref_policy
-        reward_model = self.reward_model
+        reward_models = self.reward_models
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
@@ -350,21 +355,28 @@ class RLOOTrainer(Trainer):
                             args.stop_token_id, processing_class.pad_token_id, response
                         )
 
-                    # Response Processing 2. run reward model on the truncated responses
+                    # Response Processing 2. run reward models on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
 
-                    if isinstance(reward_model, nn.Module):
-                        _, score, _ = get_reward(
-                            reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                        )
-                    else:
-                        score = torch.tensor(
-                            reward_model(
-                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
-                            ),
-                            dtype=torch.float,
-                        ).to(device)
+                    # Calculate combined score from all reward models
+                    total_score = torch.zeros_like(sequence_length, dtype=torch.float)
+                    for reward_model in reward_models:
+                        if isinstance(reward_model, nn.Module):
+                            _, score, _ = get_reward(
+                                reward_model, 
+                                postprocessed_query_response, 
+                                processing_class.pad_token_id, 
+                                context_length
+                            )
+                        else:
+                            score = torch.tensor(
+                                reward_model(
+                                    processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
+                                ),
+                                dtype=torch.float,
+                            ).to(device)
+                        total_score += score
 
                     # Store batch results
                     responses.append(response)
@@ -372,7 +384,7 @@ class RLOOTrainer(Trainer):
                     logprobs.append(logprob)
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
-                    scores.append(score)
+                    scores.append(total_score)
 
                 # Concatenate all batched results
                 responses = torch.cat(responses, 0)
@@ -411,15 +423,14 @@ class RLOOTrainer(Trainer):
                 # Compute total reward with KL penalty
                 if args.token_level_kl:
                     # Token-level KL penalty: apply KL penalty per token
-                    kl_reward = -args.kl_coef * kl
-
+                    kl_reward = -args.kl_coef * kl      
                     # Get the index of the last non-padded token for each sequence
                     eos_indices = padding_mask.size(1) - 1 - padding_mask.long().fliplr().argmax(dim=1, keepdim=True)
                     last_reward = torch.zeros_like(kl)
-                    # Ensure scores has correct shape and type
                     scores_shaped = scores.reshape(-1, 1).to(kl.dtype)
+                    # Ensure scores has correct shape and type
                     last_reward.scatter_(dim=1, index=eos_indices, src=scores_shaped)
-
+                    
                     # Combine KL reward and last reward
                     non_score_reward = kl_reward.sum(1)  # Keep this for logging
                     reward = last_reward + kl_reward
@@ -483,6 +494,7 @@ class RLOOTrainer(Trainer):
                             # PPO clipped loss
                             pg_losses = -mb_advantage * ratio
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = pg_loss_max.mean()
 
@@ -608,24 +620,32 @@ class RLOOTrainer(Trainer):
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
 
-                    if isinstance(self.reward_model, nn.Module):
-                        _, score, _ = get_reward(
-                            self.reward_model,
-                            postprocessed_query_response,
-                            processing_class.pad_token_id,
-                            context_length,
-                        )
-                    else:
-                        score = torch.tensor(
-                            self.reward_model(
-                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
-                            ),
-                            dtype=torch.float,
-                        ).to(postprocessed_query_response.device)
-                    table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
+                    # Calculate combined score from all reward models
+                    total_score = torch.zeros(postprocessed_query_response.shape[0], 
+                                           device=postprocessed_query_response.device)
+                    
+                    for reward_model in self.reward_models:
+                        if isinstance(reward_model, nn.Module):
+                            _, score, _ = get_reward(
+                                reward_model,
+                                postprocessed_query_response,
+                                processing_class.pad_token_id,
+                                context_length,
+                            )
+                        else:
+                            score = torch.tensor(
+                                reward_model(
+                                    processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
+                                ),
+                                dtype=torch.float,
+                            ).to(postprocessed_query_response.device)
+                        total_score += score
+                        
+                    table["score"].extend(self.accelerator.gather_for_metrics(total_score).float().cpu().numpy())
 
                 if sampling:
                     break
+                    
         df = pd.DataFrame(table)
 
         if self.accelerator.is_main_process:
@@ -700,3 +720,4 @@ class RLOOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+        
